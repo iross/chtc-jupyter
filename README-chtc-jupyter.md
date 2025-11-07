@@ -16,11 +16,11 @@ Automates the entire workflow:
 
 **On your laptop**:
 - `jupyter.sub` - Your HTCondor submit file (will be copied to AP)
+- `launch_jupyter.sh` - Script to launch Jupyter (will be copied to AP)
 - SSH access to CHTC AP (keys recommended)
 - This `chtc-jupyter` script
 
 **On the AP** (referenced in submit file):
-- `launch_jupyter.sh` - Script to launch Jupyter (transferred with job)
 - Container in `/staging/` (referenced in submit file)
 
 ## Usage
@@ -61,18 +61,18 @@ PORT_START=9000 PORT_END=9100 ./chtc-jupyter
 
 1. **On your laptop**, prepare your files:
    ```bash
-   # Make sure you have jupyter.sub locally
-   ls -l jupyter.sub
+   # Make sure you have the required files locally
+   ls -l jupyter.sub launch_jupyter.sh
    
    # Make the launcher executable
    chmod +x chtc-jupyter
    ```
 
-2. **On the AP**, make sure referenced files exist:
+2. **On the AP**, make sure your container exists:
    ```bash
    ssh username@ap2002.chtc.wisc.edu
-   ls -l launch_jupyter.sh
    # Make sure your container is in /staging/
+   ls -l /staging/$(whoami)/jupyter.sif
    ```
 
 ### Every Session

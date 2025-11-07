@@ -15,9 +15,10 @@ set -euo pipefail
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUBMIT_FILE="${SUBMIT_FILE:-jupyter.sub}"
-SUBMIT_DIR="${SUBMIT_DIR:-\$HOME/chtc-jupyter}"
+LAUNCH_SCRIPT="${LAUNCH_SCRIPT:-launch_jupyter.sh}"
 AP_HOST="${AP_HOST:-ap2002.chtc.wisc.edu}"
 AP_USER="${AP_USER:-${USER}}"
+SUBMIT_DIR="${SUBMIT_DIR:-/home/${AP_USER}/chtc-jupyter}"
 PORT_RANGE_START="${PORT_START:-8889}"
 PORT_RANGE_END="${PORT_END:-8999}"
 
@@ -145,23 +146,27 @@ EOFREMOTE
 submit_job() {
     local ap_host=$1
     local local_submit_file=$2
-    local remote_submit_dir=$3
+    local local_launch_script=$3
+    local remote_submit_dir=$4
 
-    # Check if local submit file exists
+    # Check if local files exist
     if [[ ! -f "$local_submit_file" ]]; then
         log_error "Submit file not found locally: $local_submit_file"
         exit 1
     fi
 
-    log_info "Copying $local_submit_file to $ap_host:$remote_submit_dir/"
+    if [[ ! -f "$local_launch_script" ]]; then
+        log_error "Launch script not found locally: $local_launch_script"
+        exit 1
+    fi
 
-    # Create remote directory and copy submit file
+    log_info "Copying files to $ap_host:$remote_submit_dir/"
+
+    # Create remote directory and copy files
     ssh "${ap_host}" "mkdir -p $remote_submit_dir"
-    scp -q "$local_submit_file" "${ap_host}:${remote_submit_dir}/"
+    scp -q "$local_submit_file" "$local_launch_script" "${ap_host}:${remote_submit_dir}/"
 
-    local remote_submit_file="${remote_submit_dir}/$(basename $local_submit_file)"
-
-    log_success "Copied to $remote_submit_file"
+    log_success "Copied $(basename $local_submit_file) and $(basename $local_launch_script)"
     log_info "Submitting job on $ap_host..."
 
     # Run condor_submit on AP and capture output
@@ -175,7 +180,7 @@ submit_job() {
         exit 1
     fi
 
-    local job_id=$(echo "$output" | grep -oP 'submitted to cluster \K\d+' | head -1)
+    local job_id=$(echo "$output" | grep -o 'submitted to cluster [0-9]*' | grep -o '[0-9]*$' | head -1)
 
     if [[ -z "$job_id" ]]; then
         log_error "Could not parse job ID from output:"
@@ -251,32 +256,36 @@ EOF
     chmod +x "$temp_ssh"
 
     # SSH to AP with port forwarding, then use condor_ssh_to_job
-    ssh -L ${port}:localhost:${port} "${ap_host}" bash << EOFAP
+    # Create script content with variables substituted
+    local ap_script=$(cat << EOFAP
 # Create the same temp script on AP
 temp_ssh=\$(mktemp)
-cat > "\$temp_ssh" << 'EOFSSH'
+cat > "\\\$temp_ssh" << 'EOFSSH'
 #!/bin/bash
 exec ssh -L ${port}:localhost:${port} "\\\$@"
 EOFSSH
-chmod +x "\$temp_ssh"
+chmod +x "\\\$temp_ssh"
 
 # Connect to job and launch Jupyter
-condor_ssh_to_job -ssh "\$temp_ssh" $job_id << 'EOFEP'
+condor_ssh_to_job -ssh "\\\$temp_ssh" ${job_id} << 'EOFEP'
 # Source conda if available
 [[ -f /opt/conda/bin/activate ]] && source /opt/conda/bin/activate
 
 # Launch Jupyter
 if [[ -f ./launch_jupyter.sh ]]; then
-    ./launch_jupyter.sh $port
+    ./launch_jupyter.sh ${port}
 else
-    export HOME=\$(pwd)
-    jupyter lab --no-browser --port=$port
+    export HOME=\\\$(pwd)
+    jupyter lab --no-browser --port=${port}
 fi
 EOFEP
 
 # Cleanup
-rm -f "\$temp_ssh"
+rm -f "\\\$temp_ssh"
 EOFAP
+)
+
+    ssh -L ${port}:localhost:${port} "${ap_host}" bash <<< "$ap_script"
 
     local status=$?
     rm -f "$temp_ssh"
@@ -293,12 +302,13 @@ Usage:
   ./chtc-jupyter
 
 Environment variables:
-  AP_HOST       Access point hostname (default: ap2002.chtc.wisc.edu)
-  AP_USER       Username on AP (default: $USER)
-  SUBMIT_FILE   Local submit file to copy (default: jupyter.sub)
-  SUBMIT_DIR    Remote directory on AP (default: $HOME/chtc-jupyter)
-  PORT_START    Port range start (default: 8889)
-  PORT_END      Port range end (default: 8999)
+  AP_HOST        Access point hostname (default: ap2002.chtc.wisc.edu)
+  AP_USER        Username on AP (default: $USER)
+  SUBMIT_FILE    Local submit file to copy (default: jupyter.sub)
+  LAUNCH_SCRIPT  Local launch script to copy (default: launch_jupyter.sh)
+  SUBMIT_DIR     Remote directory on AP (default: /home/$AP_USER/chtc-jupyter)
+  PORT_START     Port range start (default: 8889)
+  PORT_END       Port range end (default: 8999)
 
 Examples:
   # Basic usage
@@ -315,7 +325,7 @@ Examples:
 
 The script will:
   1. Find a port available on both your laptop and the AP
-  2. Copy your local submit file to the AP
+  2. Copy jupyter.sub and launch_jupyter.sh to the AP
   3. Submit the job on the AP
   4. Wait for the job to start
   5. Connect with automatic port forwarding
@@ -324,7 +334,7 @@ The script will:
 Prerequisites:
   - SSH access to CHTC AP
   - jupyter.sub exists locally (will be copied to AP)
-  - launch_jupyter.sh transferred with job
+  - launch_jupyter.sh exists locally (will be copied to AP)
   - Container in /staging/
 
 EOF
@@ -342,13 +352,20 @@ main() {
     log_info "CHTC Jupyter Launcher"
     log_info "Access Point: $ap_connection"
     log_info "Submit File: $SUBMIT_FILE"
+    log_info "Launch Script: $LAUNCH_SCRIPT"
     log_info "Remote Directory: $SUBMIT_DIR"
     log_info ""
 
-    # Check if local submit file exists
+    # Check if local files exist
     if [[ ! -f "$SUBMIT_FILE" ]]; then
         log_error "Submit file not found locally: $SUBMIT_FILE"
         log_info "Please create $SUBMIT_FILE or set SUBMIT_FILE environment variable"
+        exit 1
+    fi
+
+    if [[ ! -f "$LAUNCH_SCRIPT" ]]; then
+        log_error "Launch script not found locally: $LAUNCH_SCRIPT"
+        log_info "Please create $LAUNCH_SCRIPT or set LAUNCH_SCRIPT environment variable"
         exit 1
     fi
 
@@ -374,7 +391,7 @@ main() {
 
     # Submit job
     local job_id
-    job_id=$(submit_job "$ap_connection" "$SUBMIT_FILE" "$SUBMIT_DIR")
+    job_id=$(submit_job "$ap_connection" "$SUBMIT_FILE" "$LAUNCH_SCRIPT" "$SUBMIT_DIR")
 
     echo ""
 
