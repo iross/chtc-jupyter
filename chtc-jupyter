@@ -64,7 +64,7 @@ find_ap_port() {
     # Check ports on AP via SSH
     local available_port
     available_port=$(ssh "${ap_host}" bash << EOFREMOTE
-for port in {$start..$end}; do
+for port in $(seq $start $end); do
     if ! ss -ltn 2>/dev/null | grep -q ":\$port "; then
         echo \$port
         exit 0
