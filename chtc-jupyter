@@ -29,10 +29,10 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-log_info() { echo -e "${BLUE}[INFO]${NC} $*" >&2; }
-log_success() { echo -e "${GREEN}[OK]${NC} $*" >&2; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+log_info() { echo -e "${BLUE}$(date '+%Y-%m-%d %H:%M:%S') [INFO]${NC} $*" >&2; }
+log_success() { echo -e "${GREEN}$(date '+%Y-%m-%d %H:%M:%S') [ OK ]${NC} $*" >&2; }
+log_warn() { echo -e "${YELLOW}$(date '+%Y-%m-%d %H:%M:%S') [WARN]${NC} $*" >&2; }
+log_error() { echo -e "${RED}$(date '+%Y-%m-%d %H:%M:%S')[ERROR]${NC} $*" >&2; }
 
 # Find available port on local machine
 find_local_port() {
@@ -232,6 +232,107 @@ wait_for_job() {
     done
 }
 
+# Display Jupyter connection info and instructions
+show_connection_info() {
+    local ap_host=$1
+    local job_id=$2
+
+    echo ""
+    echo "Jupyter Lab connection info for job ${job_id}:"
+    echo "=========================================="
+    ssh "${ap_host}" "condor_ssh_to_job -auto-retry ${job_id} 'cat jupyter.log 2>/dev/null || echo \"Log file not found - Jupyter may not be running\"'" || true
+    echo "=========================================="
+    echo ""
+    echo "Copy the URL above and paste it in your browser to access Jupyter"
+    echo ""
+    echo "Jupyter is running on the execution point. To connect interactively:"
+    echo "  ssh ${ap_host}"
+    echo "  condor_ssh_to_job ${job_id}"
+    echo ""
+    echo "To stop Jupyter and clean up:"
+    echo "  ssh ${ap_host}"
+    echo "  condor_rm ${job_id}"
+    echo ""
+    echo "Press Ctrl+C to close this connection (Jupyter will keep running)"
+    echo ""
+    echo "Keeping port forwarding active..."
+}
+
+# Establish persistent port forwarding chain: Laptop -> AP -> EP
+maintain_port_forwarding() {
+    local ap_host=$1
+    local job_id=$2
+    local port=$3
+
+    ssh -L ${port}:localhost:${port} "${ap_host}" bash << EOFAP
+# Create temporary SSH script with port forwarding for EP->AP connection
+temp_ssh=\$(mktemp)
+cat > "\$temp_ssh" << 'EOFSSH'
+#!/bin/bash
+exec ssh -L ${port}:localhost:${port} "\$@"
+EOFSSH
+chmod +x "\$temp_ssh"
+
+# Use condor_ssh_to_job with the custom SSH wrapper and keep connection alive
+condor_ssh_to_job -ssh "\$temp_ssh" ${job_id} 'tail -f /dev/null'
+
+# Cleanup
+rm -f "\$temp_ssh"
+EOFAP
+
+    return $?
+}
+
+# Resume existing session
+resume_session() {
+    local ap_host=$1
+    local job_id=$2
+    local port=$3
+
+    log_info "Resuming Jupyter session for job $job_id on port $port"
+    log_info ""
+
+    show_connection_info "$ap_host" "$job_id"
+    maintain_port_forwarding "$ap_host" "$job_id" "$port"
+
+    return $?
+}
+
+# Launch Jupyter on the execution point
+launch_jupyter() {
+    local ap_host=$1
+    local job_id=$2
+    local port=$3
+
+    # Launch in background to avoid blocking
+    # The key is the entire condor_ssh_to_job heredoc needs to be backgrounded
+    # but we do it from the AP side, not wrapping the SSH call from laptop
+    ssh "${ap_host}" bash << EOFAP &
+# Create temporary SSH script with port forwarding for EP->AP connection
+temp_ssh=\$(mktemp)
+cat > "\$temp_ssh" << 'EOFSSH'
+#!/bin/bash
+exec ssh -L ${port}:localhost:${port} "\$@"
+EOFSSH
+chmod +x "\$temp_ssh"
+
+# Connect to EP and launch Jupyter (heredoc is sent to condor_ssh_to_job)
+condor_ssh_to_job -auto-retry -ssh "\$temp_ssh" ${job_id} << 'EOFEP'
+date > jupyter.log
+if [[ -f ./launch_jupyter.sh ]]; then
+    nohup ./launch_jupyter.sh ${port} > jupyter.log 2>&1 &
+else
+    export HOME=\$(pwd)
+    nohup jupyter lab --no-browser --port=${port} >> jupyter.log 2>&1 &
+fi
+exit
+EOFEP
+
+# Cleanup
+rm -f "\$temp_ssh"
+EOFAP
+}
+
 # Connect and launch Jupyter
 connect_and_launch() {
     local ap_host=$1
@@ -241,75 +342,25 @@ connect_and_launch() {
     log_info "Connecting to job $job_id with port forwarding on $port..."
     log_info ""
     log_success "Jupyter will start automatically"
-    log_info "Look for the URL with token (http://127.0.0.1:$port/lab?token=...)"
+    log_info "Look for the URL with token (http://127.0.0.1:$port=...)"
     log_info "Copy and paste it into your browser"
     log_info ""
     log_warn "Keep this terminal open to maintain the connection!"
     log_info ""
 
-    # Create temporary SSH script with port forwarding for EP connection
-    local temp_ssh=$(mktemp)
-    cat > "$temp_ssh" << EOF
-#!/bin/bash
-exec ssh -L ${port}:localhost:${port} "\$@"
-EOF
-    chmod +x "$temp_ssh"
+    # Launch Jupyter on the EP (via AP)
+    echo "Starting Jupyter Lab on port ${port}..."
+    launch_jupyter "$ap_host" "$job_id" "$port"
 
-    # SSH to AP with port forwarding, then use condor_ssh_to_job
-    # Create script content with variables substituted
-    local ap_script=$(cat << EOFAP
-# Create the same temp script on AP
-temp_ssh=\$(mktemp)
-cat > "\$temp_ssh" << 'EOFSSH'
-#!/bin/bash
-exec ssh -L ${port}:localhost:${port} "\$@"
-EOFSSH
-chmod +x "\$temp_ssh"
+    echo "Waiting for Jupyter to start..."
+    sleep 20
+    echo ""
 
-# Start Jupyter in background (heredoc must be backgrounded to avoid hanging)
-echo "Starting Jupyter Lab on port ${port}..."
-(condor_ssh_to_job -auto-retry -ssh "\$temp_ssh" ${job_id} << 'EOFEP'
-if [[ -f ./launch_jupyter.sh ]]; then
-    nohup ./launch_jupyter.sh ${port} > jupyter.log 2>&1 &
-else
-    export HOME=\$(pwd)
-    nohup jupyter lab --no-browser --port=${port} > jupyter.log 2>&1 &
-fi
-exit
-EOFEP
-) >/dev/null 2>&1 &
+    # Show connection info and establish persistent forwarding
+    show_connection_info "$ap_host" "$job_id"
+    maintain_port_forwarding "$ap_host" "$job_id" "$port"
 
-# Wait for Jupyter to start
-echo "Waiting for Jupyter to start..."
-sleep 8
-
-# Show the Jupyter output with token
-echo ""
-echo "Jupyter Lab is running! Connection info:"
-echo "=========================================="
-condor_ssh_to_job -auto-retry -ssh "\$temp_ssh" ${job_id} 'cat jupyter.log'
-echo "=========================================="
-echo ""
-echo "Copy the URL above (http://127.0.0.1:${port}/lab?token=...) and paste it in your browser"
-echo ""
-echo "Connecting you to the job for an interactive session..."
-echo "Press Ctrl+D or type 'exit' to disconnect (Jupyter will keep running)"
-echo ""
-
-# Connect interactively (without custom ssh script to avoid double port forwarding)
-condor_ssh_to_job ${job_id}
-
-# Cleanup
-rm -f "\$temp_ssh"
-EOFAP
-)
-
-    ssh -L ${port}:localhost:${port} "${ap_host}" bash <<< "$ap_script"
-
-    local status=$?
-    rm -f "$temp_ssh"
-
-    return $status
+    return $?
 }
 
 # Show usage
@@ -318,7 +369,8 @@ show_usage() {
 chtc-jupyter - Launch Jupyter Lab on CHTC HTCondor from your laptop
 
 Usage:
-  ./chtc-jupyter
+  ./chtc-jupyter                    Launch new Jupyter session
+  ./chtc-jupyter resume <JobID> <Port>   Resume existing session
 
 Environment variables:
   AP_HOST        Access point hostname (default: ap2002.chtc.wisc.edu)
@@ -364,6 +416,27 @@ main() {
     if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         show_usage
         exit 0
+    fi
+
+    # Handle resume command
+    if [[ "${1:-}" == "resume" ]]; then
+        if [[ -z "${2:-}" || -z "${3:-}" ]]; then
+            log_error "Resume requires JobID and Port"
+            log_info "Usage: $0 resume <JobID> <Port>"
+            exit 1
+        fi
+        local job_id=$2
+        local port=$3
+        local ap_connection="${AP_USER}@${AP_HOST}"
+
+        log_info "CHTC Jupyter Launcher - Resume Mode"
+        log_info "Access Point: $ap_connection"
+        log_info "Job ID: $job_id"
+        log_info "Port: $port"
+        log_info ""
+
+        resume_session "$ap_connection" "$job_id" "$port"
+        exit $?
     fi
 
     local ap_connection="${AP_USER}@${AP_HOST}"
