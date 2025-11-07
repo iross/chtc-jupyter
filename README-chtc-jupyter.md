@@ -14,14 +14,14 @@ Automates the entire workflow:
 
 ## Prerequisites
 
-**On the AP** (one-time setup):
-- `jupyter.sub` - Your HTCondor submit file
-- `launch_jupyter.sh` - Script to launch Jupyter (transferred with job)
-- Container in `/staging/` (referenced in submit file)
-
 **On your laptop**:
+- `jupyter.sub` - Your HTCondor submit file (will be copied to AP)
 - SSH access to CHTC AP (keys recommended)
 - This `chtc-jupyter` script
+
+**On the AP** (referenced in submit file):
+- `launch_jupyter.sh` - Script to launch Jupyter (transferred with job)
+- Container in `/staging/` (referenced in submit file)
 
 ## Usage
 
@@ -45,6 +45,11 @@ Custom submit file:
 SUBMIT_FILE=my-jupyter.sub ./chtc-jupyter
 ```
 
+Custom remote directory on AP:
+```bash
+SUBMIT_DIR=/home/username/my-jobs ./chtc-jupyter
+```
+
 Custom port range:
 ```bash
 PORT_START=9000 PORT_END=9100 ./chtc-jupyter
@@ -54,16 +59,20 @@ PORT_START=9000 PORT_END=9100 ./chtc-jupyter
 
 ### One-Time Setup
 
-1. **On the AP**, make sure you have these files:
+1. **On your laptop**, prepare your files:
    ```bash
-   ssh username@ap2002.chtc.wisc.edu
-   ls -l jupyter.sub launch_jupyter.sh
-   # Make sure your container is in /staging/
+   # Make sure you have jupyter.sub locally
+   ls -l jupyter.sub
+   
+   # Make the launcher executable
+   chmod +x chtc-jupyter
    ```
 
-2. **On your laptop**, download the script:
+2. **On the AP**, make sure referenced files exist:
    ```bash
-   chmod +x chtc-jupyter
+   ssh username@ap2002.chtc.wisc.edu
+   ls -l launch_jupyter.sh
+   # Make sure your container is in /staging/
    ```
 
 ### Every Session
@@ -76,10 +85,11 @@ PORT_START=9000 PORT_END=9100 ./chtc-jupyter
 The script will:
 1. Test SSH connection to the AP
 2. Scan for available ports (shows progress)
-3. Submit the job
-4. Wait for it to start (shows dots)
-5. Connect and launch Jupyter
-6. Display the URL
+3. Copy jupyter.sub to the AP (into ~/chtc-jupyter/ by default)
+4. Submit the job
+5. Wait for it to start (shows dots)
+6. Connect and launch Jupyter
+7. Display the URL
 
 **Copy the URL** (looks like `http://127.0.0.1:8889/lab?token=abc123...`) and paste it into your browser.
 
@@ -119,7 +129,8 @@ This means **you don't need to manually specify ports** and **multiple users can
 |----------|---------|-------------|
 | `AP_HOST` | `ap2002.chtc.wisc.edu` | Access point hostname |
 | `AP_USER` | `$USER` | Username on AP |
-| `SUBMIT_FILE` | `jupyter.sub` | Submit file path on AP |
+| `SUBMIT_FILE` | `jupyter.sub` | Local submit file to copy |
+| `SUBMIT_DIR` | `$HOME/chtc-jupyter` | Remote directory on AP |
 | `PORT_START` | `8889` | Port range start |
 | `PORT_END` | `8999` | Port range end |
 
@@ -192,13 +203,13 @@ ssh-copy-id username@ap2002.chtc.wisc.edu
 AP_USER=myusername ./chtc-jupyter
 ```
 
-### "Submit file not found"
+### "Submit file not found locally"
 ```bash
-# Make sure jupyter.sub exists on the AP
-ssh username@ap2002.chtc.wisc.edu ls -l jupyter.sub
+# Make sure jupyter.sub exists on your laptop
+ls -l jupyter.sub
 
-# Or specify the path
-SUBMIT_FILE=~/jupyter-configs/jupyter.sub ./chtc-jupyter
+# Or specify a different file
+SUBMIT_FILE=~/jupyter-configs/my-jupyter.sub ./chtc-jupyter
 ```
 
 ### "Job is held"
@@ -285,11 +296,12 @@ export SUBMIT_FILE=jupyter.sub
 
 **On your laptop:**
 - `chtc-jupyter` - This launcher script
+- `jupyter.sub` - Your submit file (copied to AP automatically)
 
 **On the AP:**
-- `jupyter.sub` - Your submit file
-- `launch_jupyter.sh` - EP launcher (transferred with job)
+- `launch_jupyter.sh` - EP launcher (transferred with job via submit file)
 - Container in `/staging/` (referenced in submit file)
+- `~/chtc-jupyter/` - Created automatically by script (contains copied submit file)
 
 **No longer needed:**
 - ❌ `custom_ssh.sh` - Script handles this internally

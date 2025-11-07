@@ -15,6 +15,7 @@ set -euo pipefail
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUBMIT_FILE="${SUBMIT_FILE:-jupyter.sub}"
+SUBMIT_DIR="${SUBMIT_DIR:-\$HOME/chtc-jupyter}"
 AP_HOST="${AP_HOST:-ap2002.chtc.wisc.edu}"
 AP_USER="${AP_USER:-${USER}}"
 PORT_RANGE_START="${PORT_START:-8889}"
@@ -143,13 +144,29 @@ EOFREMOTE
 # Submit job on AP
 submit_job() {
     local ap_host=$1
-    local submit_file=$2
+    local local_submit_file=$2
+    local remote_submit_dir=$3
 
-    log_info "Submitting job on $ap_host from $submit_file..."
+    # Check if local submit file exists
+    if [[ ! -f "$local_submit_file" ]]; then
+        log_error "Submit file not found locally: $local_submit_file"
+        exit 1
+    fi
+
+    log_info "Copying $local_submit_file to $ap_host:$remote_submit_dir/"
+
+    # Create remote directory and copy submit file
+    ssh "${ap_host}" "mkdir -p $remote_submit_dir"
+    scp -q "$local_submit_file" "${ap_host}:${remote_submit_dir}/"
+
+    local remote_submit_file="${remote_submit_dir}/$(basename $local_submit_file)"
+
+    log_success "Copied to $remote_submit_file"
+    log_info "Submitting job on $ap_host..."
 
     # Run condor_submit on AP and capture output
     local output
-    output=$(ssh "${ap_host}" "cd ~ && condor_submit $submit_file" 2>&1)
+    output=$(ssh "${ap_host}" "cd $remote_submit_dir && condor_submit $(basename $local_submit_file)" 2>&1)
     local status=$?
 
     if [[ $status -ne 0 ]]; then
@@ -278,7 +295,8 @@ Usage:
 Environment variables:
   AP_HOST       Access point hostname (default: ap2002.chtc.wisc.edu)
   AP_USER       Username on AP (default: $USER)
-  SUBMIT_FILE   Submit file on AP (default: jupyter.sub)
+  SUBMIT_FILE   Local submit file to copy (default: jupyter.sub)
+  SUBMIT_DIR    Remote directory on AP (default: $HOME/chtc-jupyter)
   PORT_START    Port range start (default: 8889)
   PORT_END      Port range end (default: 8999)
 
@@ -297,14 +315,15 @@ Examples:
 
 The script will:
   1. Find a port available on both your laptop and the AP
-  2. Submit your jupyter.sub on the AP
-  3. Wait for the job to start
-  4. Connect with automatic port forwarding
-  5. Launch Jupyter and display the connection URL
+  2. Copy your local submit file to the AP
+  3. Submit the job on the AP
+  4. Wait for the job to start
+  5. Connect with automatic port forwarding
+  6. Launch Jupyter and display the connection URL
 
 Prerequisites:
   - SSH access to CHTC AP
-  - jupyter.sub exists on the AP
+  - jupyter.sub exists locally (will be copied to AP)
   - launch_jupyter.sh transferred with job
   - Container in /staging/
 
@@ -323,7 +342,15 @@ main() {
     log_info "CHTC Jupyter Launcher"
     log_info "Access Point: $ap_connection"
     log_info "Submit File: $SUBMIT_FILE"
+    log_info "Remote Directory: $SUBMIT_DIR"
     log_info ""
+
+    # Check if local submit file exists
+    if [[ ! -f "$SUBMIT_FILE" ]]; then
+        log_error "Submit file not found locally: $SUBMIT_FILE"
+        log_info "Please create $SUBMIT_FILE or set SUBMIT_FILE environment variable"
+        exit 1
+    fi
 
     # Test SSH connection
     log_info "Testing SSH connection to $ap_connection..."
@@ -347,7 +374,7 @@ main() {
 
     # Submit job
     local job_id
-    job_id=$(submit_job "$ap_connection" "$SUBMIT_FILE")
+    job_id=$(submit_job "$ap_connection" "$SUBMIT_FILE" "$SUBMIT_DIR")
 
     echo ""
 
