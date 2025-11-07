@@ -260,14 +260,14 @@ EOF
     local ap_script=$(cat << EOFAP
 # Create the same temp script on AP
 temp_ssh=\$(mktemp)
-cat > "\\\$temp_ssh" << 'EOFSSH'
+cat > "\$temp_ssh" << 'EOFSSH'
 #!/bin/bash
-exec ssh -L ${port}:localhost:${port} "\\\$@"
+exec ssh -L ${port}:localhost:${port} "\$@"
 EOFSSH
-chmod +x "\\\$temp_ssh"
+chmod +x "\$temp_ssh"
 
 # Connect to job and launch Jupyter
-condor_ssh_to_job -ssh "\\\$temp_ssh" ${job_id} << 'EOFEP'
+condor_ssh_to_job -ssh "\$temp_ssh" ${job_id} << 'EOFEP'
 # Source conda if available
 [[ -f /opt/conda/bin/activate ]] && source /opt/conda/bin/activate
 
@@ -275,13 +275,13 @@ condor_ssh_to_job -ssh "\\\$temp_ssh" ${job_id} << 'EOFEP'
 if [[ -f ./launch_jupyter.sh ]]; then
     ./launch_jupyter.sh ${port}
 else
-    export HOME=\\\$(pwd)
+    export HOME=\$(pwd)
     jupyter lab --no-browser --port=${port}
 fi
 EOFEP
 
 # Cleanup
-rm -f "\\\$temp_ssh"
+rm -f "\$temp_ssh"
 EOFAP
 )
 
