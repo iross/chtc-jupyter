@@ -1,0 +1,27 @@
+# jupyter.sub
+log = jupyter.log
+
+container_image = file:///staging/iaross/jupyter.sif
+
+transfer_executable = false
+transfer_input_files = launch_jupyter.sh
+
+executable = /bin/sleep
+arguments = 12h
+output = jupyter.out
+error = jupyter.err
+
+# Adjust resources as desired
+request_cpus = 1
+request_memory = 16GB
+request_disk = 16GB
+
+## If using GPUs:
++WantGPULab = true
++GPUJobLength = "short"
++is_resumable = true
+request_gpus = 1
+## adjust as desired:
+#gpus_minimum_memory = 10GB
+gpus_minimum_capability = 7.0
+#gpus_maximum_capability = 8.9
