@@ -2,18 +2,23 @@
 #
 # chtc-jupyter - Simplified Jupyter Lab launcher for CHTC HTCondor
 #
-# Automates the workflow:
-#   1. Submit jupyter.sub
-#   2. Wait for job to start
-#   3. Connect via condor_ssh_to_job with port forwarding
-#   4. Launch Jupyter on the EP
+# Run from your laptop to:
+#   1. Find available port on laptop and AP
+#   2. SSH to AP and submit jupyter.sub
+#   3. Wait for job to start
+#   4. Connect via condor_ssh_to_job with port forwarding
+#   5. Launch Jupyter on the EP
 #
 
 set -euo pipefail
 
+# Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUBMIT_FILE="${SUBMIT_FILE:-jupyter.sub}"
-PORT="${PORT:-8889}"
+AP_HOST="${AP_HOST:-ap2002.chtc.wisc.edu}"
+AP_USER="${AP_USER:-${USER}}"
+PORT_RANGE_START="${PORT_START:-8889}"
+PORT_RANGE_END="${PORT_END:-8999}"
 
 # Colors
 RED='\033[0;31m'
@@ -24,14 +29,127 @@ NC='\033[0m'
 
 log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
-# Submit the job
-submit_job() {
-    log_info "Submitting job from $SUBMIT_FILE..."
+# Find available port on local machine
+find_local_port() {
+    local start=$1
+    local end=$2
 
+    log_info "Scanning for available port on laptop ($start-$end)..."
+
+    for port in $(seq $start $end); do
+        if ! lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
+            log_success "Port $port is available on laptop"
+            echo $port
+            return 0
+        fi
+    done
+
+    log_error "No available ports on laptop in range $start-$end"
+    return 1
+}
+
+# Find available port on AP
+find_ap_port() {
+    local ap_host=$1
+    local start=$2
+    local end=$3
+
+    log_info "Scanning for available port on $ap_host ($start-$end)..."
+
+    # Check ports on AP via SSH
+    local available_port
+    available_port=$(ssh "${ap_host}" bash << EOFREMOTE
+for port in {$start..$end}; do
+    if ! ss -ltn 2>/dev/null | grep -q ":\$port "; then
+        echo \$port
+        exit 0
+    fi
+done
+exit 1
+EOFREMOTE
+)
+
+    local status=$?
+
+    if [[ $status -eq 0 && -n "$available_port" ]]; then
+        log_success "Port $available_port is available on $ap_host"
+        echo $available_port
+        return 0
+    else
+        log_error "No available ports on $ap_host in range $start-$end"
+        return 1
+    fi
+}
+
+# Find a port available on BOTH laptop and AP
+find_common_port() {
+    local ap_host=$1
+    local start=$2
+    local end=$3
+
+    log_info "Finding port available on both laptop and $ap_host..."
+
+    # Get list of available ports on laptop
+    local laptop_ports=()
+    for port in $(seq $start $end); do
+        if ! lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
+            laptop_ports+=($port)
+        fi
+    done
+
+    if [[ ${#laptop_ports[@]} -eq 0 ]]; then
+        log_error "No available ports on laptop in range $start-$end"
+        return 1
+    fi
+
+    log_info "Found ${#laptop_ports[@]} available ports on laptop"
+
+    # Check which of these are available on AP
+    log_info "Checking availability on $ap_host..."
+
+    local port_list="${laptop_ports[*]}"
+    local common_port
+    common_port=$(ssh "${ap_host}" bash << EOFREMOTE
+# Ports to check
+ports=($port_list)
+
+for port in "\${ports[@]}"; do
+    if ! ss -ltn 2>/dev/null | grep -q ":\$port "; then
+        echo \$port
+        exit 0
+    fi
+done
+exit 1
+EOFREMOTE
+)
+
+    local status=$?
+
+    if [[ $status -eq 0 && -n "$common_port" ]]; then
+        log_success "Port $common_port is available on both laptop and $ap_host"
+        echo $common_port
+        return 0
+    else
+        log_error "No common available port found"
+        log_warn "Laptop has ports available: ${laptop_ports[*]:0:10}..."
+        log_warn "But none are free on the AP"
+        return 1
+    fi
+}
+
+# Submit job on AP
+submit_job() {
+    local ap_host=$1
+    local submit_file=$2
+
+    log_info "Submitting job on $ap_host from $submit_file..."
+
+    # Run condor_submit on AP and capture output
     local output
-    output=$(condor_submit "$SUBMIT_FILE" 2>&1)
+    output=$(ssh "${ap_host}" "cd ~ && condor_submit $submit_file" 2>&1)
     local status=$?
 
     if [[ $status -ne 0 ]]; then
@@ -43,7 +161,8 @@ submit_job() {
     local job_id=$(echo "$output" | grep -oP 'submitted to cluster \K\d+' | head -1)
 
     if [[ -z "$job_id" ]]; then
-        log_error "Could not parse job ID"
+        log_error "Could not parse job ID from output:"
+        echo "$output"
         exit 1
     fi
 
@@ -53,29 +172,34 @@ submit_job() {
 
 # Wait for job to start running
 wait_for_job() {
-    local job_id=$1
+    local ap_host=$1
+    local job_id=$2
 
     log_info "Waiting for job $job_id to start..."
 
     while true; do
-        local status=$(condor_q "$job_id" -af JobStatus 2>/dev/null || echo "")
+        local status
+        status=$(ssh "${ap_host}" "condor_q $job_id -af JobStatus 2>/dev/null" || echo "")
 
         if [[ -z "$status" ]]; then
-            log_error "Job $job_id not found"
+            log_error "Job $job_id not found in queue"
             exit 1
         fi
 
         case $status in
             2) # Running
+                echo ""
                 log_success "Job is running"
                 return 0
                 ;;
             3|4) # Removed/Completed
+                echo ""
                 log_error "Job ended before starting"
                 exit 1
                 ;;
             5) # Held
-                log_error "Job is held. Check: condor_q -hold $job_id"
+                echo ""
+                log_error "Job is held. Check with: ssh $ap_host condor_q -hold $job_id"
                 exit 1
                 ;;
             1) # Idle
@@ -86,18 +210,22 @@ wait_for_job() {
     done
 }
 
-# Connect and launch
+# Connect and launch Jupyter
 connect_and_launch() {
-    local job_id=$1
-    local port=$2
+    local ap_host=$1
+    local job_id=$2
+    local port=$3
 
-    log_info "Connecting to job $job_id with port $port..."
+    log_info "Connecting to job $job_id with port forwarding on $port..."
     log_info ""
-    log_info "Jupyter will start automatically."
-    log_info "Look for the URL with token and paste it in your browser."
+    log_success "Jupyter will start automatically"
+    log_info "Look for the URL with token (http://127.0.0.1:$port/lab?token=...)"
+    log_info "Copy and paste it into your browser"
+    log_info ""
+    log_warn "Keep this terminal open to maintain the connection!"
     log_info ""
 
-    # Create temporary SSH script with port forwarding
+    # Create temporary SSH script with port forwarding for EP connection
     local temp_ssh=$(mktemp)
     cat > "$temp_ssh" << EOF
 #!/bin/bash
@@ -105,9 +233,19 @@ exec ssh -L ${port}:localhost:${port} "\$@"
 EOF
     chmod +x "$temp_ssh"
 
-    # Connect and run launch script
-    condor_ssh_to_job -ssh "$temp_ssh" "$job_id" << EOFREMOTE
-# Source conda if needed
+    # SSH to AP with port forwarding, then use condor_ssh_to_job
+    ssh -L ${port}:localhost:${port} "${ap_host}" bash << EOFAP
+# Create the same temp script on AP
+temp_ssh=\$(mktemp)
+cat > "\$temp_ssh" << 'EOFSSH'
+#!/bin/bash
+exec ssh -L ${port}:localhost:${port} "\\\$@"
+EOFSSH
+chmod +x "\$temp_ssh"
+
+# Connect to job and launch Jupyter
+condor_ssh_to_job -ssh "\$temp_ssh" $job_id << 'EOFEP'
+# Source conda if available
 [[ -f /opt/conda/bin/activate ]] && source /opt/conda/bin/activate
 
 # Launch Jupyter
@@ -117,26 +255,109 @@ else
     export HOME=\$(pwd)
     jupyter lab --no-browser --port=$port
 fi
-EOFREMOTE
+EOFEP
 
+# Cleanup
+rm -f "\$temp_ssh"
+EOFAP
+
+    local status=$?
     rm -f "$temp_ssh"
+
+    return $status
+}
+
+# Show usage
+show_usage() {
+    cat << 'EOF'
+chtc-jupyter - Launch Jupyter Lab on CHTC HTCondor from your laptop
+
+Usage:
+  ./chtc-jupyter
+
+Environment variables:
+  AP_HOST       Access point hostname (default: ap2002.chtc.wisc.edu)
+  AP_USER       Username on AP (default: $USER)
+  SUBMIT_FILE   Submit file on AP (default: jupyter.sub)
+  PORT_START    Port range start (default: 8889)
+  PORT_END      Port range end (default: 8999)
+
+Examples:
+  # Basic usage
+  ./chtc-jupyter
+
+  # Different access point
+  AP_HOST=ap2001.chtc.wisc.edu ./chtc-jupyter
+
+  # Custom submit file
+  SUBMIT_FILE=my-jupyter.sub ./chtc-jupyter
+
+  # Custom port range
+  PORT_START=9000 PORT_END=9100 ./chtc-jupyter
+
+The script will:
+  1. Find a port available on both your laptop and the AP
+  2. Submit your jupyter.sub on the AP
+  3. Wait for the job to start
+  4. Connect with automatic port forwarding
+  5. Launch Jupyter and display the connection URL
+
+Prerequisites:
+  - SSH access to CHTC AP
+  - jupyter.sub exists on the AP
+  - launch_jupyter.sh transferred with job
+  - Container in /staging/
+
+EOF
 }
 
 # Main
 main() {
-    if [[ ! -f "$SUBMIT_FILE" ]]; then
-        log_error "Submit file not found: $SUBMIT_FILE"
-        log_info "Usage: PORT=8889 SUBMIT_FILE=jupyter.sub $0"
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        show_usage
+        exit 0
+    fi
+
+    local ap_connection="${AP_USER}@${AP_HOST}"
+
+    log_info "CHTC Jupyter Launcher"
+    log_info "Access Point: $ap_connection"
+    log_info "Submit File: $SUBMIT_FILE"
+    log_info ""
+
+    # Test SSH connection
+    log_info "Testing SSH connection to $ap_connection..."
+    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "${ap_connection}" "echo ok" >/dev/null 2>&1; then
+        log_error "Cannot connect to $ap_connection"
+        log_info "Make sure you have SSH access and keys set up"
+        log_info "Try: ssh $ap_connection"
+        exit 1
+    fi
+    log_success "SSH connection OK"
+
+    # Find common available port
+    local port
+    port=$(find_common_port "$ap_connection" "$PORT_RANGE_START" "$PORT_RANGE_END")
+    if [[ $? -ne 0 ]]; then
+        log_error "Could not find available port"
         exit 1
     fi
 
-    local job_id
-    job_id=$(submit_job)
+    echo ""
 
-    wait_for_job "$job_id"
+    # Submit job
+    local job_id
+    job_id=$(submit_job "$ap_connection" "$SUBMIT_FILE")
 
     echo ""
-    connect_and_launch "$job_id" "$PORT"
+
+    # Wait for job to start
+    wait_for_job "$ap_connection" "$job_id"
+
+    echo ""
+
+    # Connect and launch
+    connect_and_launch "$ap_connection" "$job_id" "$port"
 }
 
 main "$@"
