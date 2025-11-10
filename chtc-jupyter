@@ -236,6 +236,7 @@ wait_for_job() {
 show_connection_info() {
     local ap_host=$1
     local job_id=$2
+    local port=$3
 
     echo ""
     echo "Jupyter Lab connection info for job ${job_id}:"
@@ -256,6 +257,9 @@ show_connection_info() {
     echo "Press Ctrl+C to close this connection (Jupyter will keep running)"
     echo ""
     echo "Keeping port forwarding active..."
+    echo "If you need to resume, run:"
+    echo "  ./chtc-jupyter resume ${job_id} ${port}"
+    echo ""
 }
 
 # Establish persistent port forwarding chain: Laptop -> AP -> EP
@@ -292,7 +296,7 @@ resume_session() {
     log_info "Resuming Jupyter session for job $job_id on port $port"
     log_info ""
 
-    show_connection_info "$ap_host" "$job_id"
+    show_connection_info "$ap_host" "$job_id" "$port"
     maintain_port_forwarding "$ap_host" "$job_id" "$port"
 
     return $?
@@ -357,7 +361,7 @@ connect_and_launch() {
     echo ""
 
     # Show connection info and establish persistent forwarding
-    show_connection_info "$ap_host" "$job_id"
+    show_connection_info "$ap_host" "$job_id" "$port"
     maintain_port_forwarding "$ap_host" "$job_id" "$port"
 
     return $?
