@@ -6,7 +6,7 @@ container_image = file:///staging/iaross/jupyter_lite.sif
 transfer_executable = false
 transfer_input_files = launch_jupyter.sh
 when_to_transfer_output = ON_EXIT_OR_EVICT
-
+# See https://htcondor.readthedocs.io/en/main/faq/users/transfer-files-on-rm.html
 My.SpoolOnEvict = false
 
 executable = /bin/sleep
