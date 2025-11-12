@@ -307,9 +307,23 @@ export SUBMIT_FILE=jupyter.sub
 - ❌ `custom_ssh.sh` - Script handles this internally
 - ❌ Manual SSH port forwarding - Script does it automatically
 
+## Optional: SSH Configuration
+
+For users who frequently connect to CHTC access points, you can optionally set up SSH configuration shortcuts to:
+- Use short aliases instead of full hostnames (`ssh chtc-ap`)
+- Enable connection reuse (no re-authentication for 10 minutes)
+- Automatically keep connections alive during long sessions
+
+**This is completely optional** - the `chtc-jupyter` script works perfectly without any SSH config customization.
+
+**Files:**
+- **`ssh-config-template`** - Copy-paste SSH config examples
+- **`ssh-config-guide.md`** - Comprehensive guide with security considerations
+
+**Security note**: Some configurations (like ControlMaster) should only be used on personal, secure workstations. Read the guide before using.
+
 ## Future Enhancements
 
 See backlog for planned improvements:
 - **task-1.1**: tmux/screen for session persistence
-- **task-1.2**: SSH config templates (optional optimization)
 - **task-1.4**: Automatic job cleanup on disconnect
