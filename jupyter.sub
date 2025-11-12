@@ -5,7 +5,9 @@ container_image = file:///staging/iaross/jupyter_lite.sif
 
 transfer_executable = false
 transfer_input_files = launch_jupyter.sh
-transfer_output_files = output
+when_to_transfer_output = ON_EXIT_OR_EVICT
+
+My.SpoolOnEvict = false
 
 executable = /bin/sleep
 arguments = 12h
