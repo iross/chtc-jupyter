@@ -1,0 +1,68 @@
+# SSH Configuration Template for CHTC Jupyter Sessions
+#
+# This template provides optional SSH configuration optimizations for connecting
+# to CHTC HTCondor access points and execution points.
+#
+# INSTALLATION:
+#   1. Copy the Host blocks below to your ~/.ssh/config file
+#   2. Replace YOUR_USERNAME with your actual CHTC username
+#   3. Adjust settings as needed for your use case
+#   4. Ensure file permissions: chmod 600 ~/.ssh/config
+#
+# SECURITY NOTE:
+#   ControlMaster settings allow connection reuse, which can be convenient but
+#   may pose security risks on shared systems. Only use these settings on your
+#   personal, secure workstation. See documentation for details.
+#
+# ============================================================================
+# CHTC Access Point - Basic Configuration
+# ============================================================================
+# This is the minimal configuration for connecting to a CHTC access point.
+# The chtc-jupyter script handles port forwarding automatically, so you
+# typically don't need LocalForward here unless using manual SSH.
+
+Host chtc-ap
+    HostName ap2002.chtc.wisc.edu
+    User YOUR_USERNAME
+
+# Alternative access point (uncomment if needed)
+# Host chtc-ap2001
+#     HostName ap2001.chtc.wisc.edu
+#     User YOUR_USERNAME
+
+# ============================================================================
+# CHTC Access Point - With ControlMaster (Advanced)
+# ============================================================================
+# ControlMaster allows SSH connection reuse, eliminating the need to
+# re-authenticate for each new SSH connection to the same host.
+#
+# BENEFITS:
+#   - Faster subsequent connections (no re-authentication)
+#   - Single authentication for multiple terminal windows/sessions
+#   - Useful when frequently connecting/disconnecting during development
+#
+# SECURITY WARNINGS:
+#   - Anyone with access to your user account can reuse the connection
+#   - On shared systems, this could allow others to piggyback on your session
+#   - Socket files in /tmp may be accessible depending on system configuration
+#   - Only use on personal, secure workstations
+#   - Do NOT use on shared lab computers or multi-user systems
+#
+# For more information, see: man ssh_config (search for ControlMaster)
+
+Host chtc-ap-shared
+    HostName ap2002.chtc.wisc.edu
+    User YOUR_USERNAME
+    # Enable connection multiplexing
+    ControlMaster auto
+    ControlPath ~/.ssh/control-%r@%h:%p
+    ControlPersist 10m
+
+# ============================================================================
+# Notes on SSH Config Organization
+# ============================================================================
+# - More specific Host patterns should come before general ones
+# - First matching Host block wins for each setting
+# - You can have multiple Host blocks that match the same hostname
+# - Settings accumulate from all matching blocks (first match wins per setting)
+# - Use 'ssh -vvv' to debug connection issues and see which config is used
