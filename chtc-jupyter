@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# chtc-jupyter - Simplified Jupyter Lab launcher for CHTC HTCondor
+# chtc-jupyter - Simplified Jupyter Lab launcher for CHTC
 #
 # Run from your laptop to:
 #   1. Find available port on laptop and AP
