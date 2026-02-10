@@ -1,0 +1,426 @@
+#!/bin/bash
+#
+# chtc-vscode - VS Code Remote launcher for CHTC via VS Code Tunnels
+#
+# Run from your laptop to:
+#   1. SSH to AP and submit vscode.sub
+#   2. Wait for job to start
+#   3. Launch VS Code tunnel on the EP via condor_ssh_to_job
+#   4. Display GitHub device auth instructions
+#   5. Display tunnel connection instructions
+#
+
+set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUBMIT_FILE="${SUBMIT_FILE:-vscode.sub}"
+LAUNCH_SCRIPT="${LAUNCH_SCRIPT:-launch_vscode.sh}"
+AP_HOST="${AP_HOST:-ap2002.chtc.wisc.edu}"
+AP_USER="${AP_USER:-${USER}}"
+SUBMIT_DIR="${SUBMIT_DIR:-/home/${AP_USER}/chtc-vscode}"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info() { echo -e "${BLUE}$(date '+%Y-%m-%d %H:%M:%S') [INFO]${NC} $*" >&2; }
+log_success() { echo -e "${GREEN}$(date '+%Y-%m-%d %H:%M:%S') [ OK ]${NC} $*" >&2; }
+log_warn() { echo -e "${YELLOW}$(date '+%Y-%m-%d %H:%M:%S') [WARN]${NC} $*" >&2; }
+log_error() { echo -e "${RED}$(date '+%Y-%m-%d %H:%M:%S')[ERROR]${NC} $*" >&2; }
+
+# Submit job on AP
+submit_job() {
+    local ap_host=$1
+    local local_submit_file=$2
+    local local_launch_script=$3
+    local remote_submit_dir=$4
+
+    # Check if local files exist
+    if [[ ! -f "$local_submit_file" ]]; then
+        log_error "Submit file not found locally: $local_submit_file"
+        exit 1
+    fi
+
+    if [[ ! -f "$local_launch_script" ]]; then
+        log_error "Launch script not found locally: $local_launch_script"
+        exit 1
+    fi
+
+    log_info "Copying files to $ap_host:$remote_submit_dir/"
+
+    # Create remote directory and copy files
+    ssh "${ap_host}" "mkdir -p $remote_submit_dir"
+    scp -q "$local_submit_file" "$local_launch_script" "${ap_host}:${remote_submit_dir}/"
+
+    log_success "Copied $(basename $local_submit_file) and $(basename $local_launch_script)"
+    log_info "Submitting job on $ap_host..."
+
+    # Run condor_submit on AP and capture output
+    local output
+    output=$(ssh "${ap_host}" "cd $remote_submit_dir && condor_submit $(basename $local_submit_file)" 2>&1)
+    local status=$?
+
+    if [[ $status -ne 0 ]]; then
+        log_error "Submit failed:"
+        echo "$output"
+        exit 1
+    fi
+
+    local job_id=$(echo "$output" | grep -o 'submitted to cluster [0-9]*' | grep -o '[0-9]*$' | head -1)
+
+    if [[ -z "$job_id" ]]; then
+        log_error "Could not parse job ID from output:"
+        echo "$output"
+        exit 1
+    fi
+
+    log_success "Submitted as job $job_id"
+    echo "$job_id"
+}
+
+# Wait for job to start running
+wait_for_job() {
+    local ap_host=$1
+    local job_id=$2
+
+    log_info "Waiting for job $job_id to start..."
+
+    while true; do
+        local status
+        status=$(ssh "${ap_host}" "condor_q $job_id -af JobStatus 2>/dev/null" || echo "")
+
+        if [[ -z "$status" ]]; then
+            log_error "Job $job_id not found in queue"
+            exit 1
+        fi
+
+        case $status in
+            2) # Running
+                echo ""
+                log_success "Job is running"
+                return 0
+                ;;
+            3|4) # Removed/Completed
+                echo ""
+                log_error "Job ended before starting"
+                exit 1
+                ;;
+            5) # Held
+                echo ""
+                log_error "Job is held. Check with: ssh $ap_host condor_q -hold $job_id"
+                exit 1
+                ;;
+            1) # Idle
+                echo -n "."
+                sleep 5
+                ;;
+        esac
+    done
+}
+
+# Launch VS Code tunnel on the EP (in background via condor_ssh_to_job)
+launch_tunnel() {
+    local ap_host=$1
+    local job_id=$2
+    local tunnel_name=$3
+
+    log_info "Starting VS Code tunnel (name: $tunnel_name)..."
+
+    ssh "${ap_host}" bash << EOFAP &
+condor_ssh_to_job -auto-retry ${job_id} << 'EOFEP'
+nohup ./launch_vscode.sh ${tunnel_name} > vscode.log 2>&1 &
+exit
+EOFEP
+EOFAP
+}
+
+# Poll vscode.log for the GitHub device auth URL and code
+wait_for_device_auth() {
+    local ap_host=$1
+    local job_id=$2
+    local max_attempts=60
+
+    log_info "Waiting for GitHub device authentication prompt..."
+
+    for i in $(seq 1 $max_attempts); do
+        local log_content
+        log_content=$(ssh "${ap_host}" "condor_ssh_to_job -auto-retry ${job_id} 'cat vscode.log 2>/dev/null'" 2>/dev/null || echo "")
+
+        # Show log content periodically so user can see what's happening
+        if [[ -n "$log_content" ]] && (( i % 6 == 1 )); then
+            echo ""
+            log_info "Current vscode.log contents:"
+            echo "$log_content" | tail -5
+        fi
+
+        # Look for the device code pattern - VS Code tunnel outputs a URL and code
+        local device_code
+        device_code=$(echo "$log_content" | grep -oE '[A-Z0-9]{4}-[A-Z0-9]{4}' | head -1 || true)
+
+        if [[ -n "$device_code" ]]; then
+            echo ""
+            echo ""
+            echo "=========================================="
+            echo "  GitHub Device Authentication Required"
+            echo "  1. Open https://github.com/login/device"
+            echo "  2. Enter code: $device_code"
+            echo "  3. Authorize \"Visual Studio Code\""
+            echo "=========================================="
+            echo ""
+            return 0
+        fi
+
+        # Check if tunnel is already established (no auth needed, e.g. cached credentials)
+        if echo "$log_content" | grep -qi "tunnel is ready\|connected to tunnel\|is connected"; then
+            echo ""
+            return 0
+        fi
+
+        echo -n "."
+        sleep 5
+    done
+
+    echo ""
+    log_warn "Timed out waiting for device auth prompt."
+    log_info "Check the log manually:"
+    log_info "  ssh $ap_host condor_ssh_to_job $job_id 'cat vscode.log'"
+    return 1
+}
+
+# Wait for tunnel to be fully established
+wait_for_tunnel() {
+    local ap_host=$1
+    local job_id=$2
+    local tunnel_name=$3
+    local max_attempts=60
+
+    log_info "Waiting for tunnel to be established..."
+
+    for i in $(seq 1 $max_attempts); do
+        local log_content
+        log_content=$(ssh "${ap_host}" "condor_ssh_to_job -auto-retry ${job_id} 'cat vscode.log 2>/dev/null'" 2>/dev/null || echo "")
+
+        # Show log periodically so user can see progress
+        if [[ -n "$log_content" ]] && (( i % 6 == 1 )); then
+            echo ""
+            log_info "Current vscode.log contents:"
+            echo "$log_content" | tail -5
+        fi
+
+        # Match various patterns code tunnel uses when ready
+        if echo "$log_content" | grep -qiE "tunnel is ready|connected to tunnel|is connected|tunnel name:|open this link|ready to accept"; then
+            echo ""
+            log_success "Tunnel established: $tunnel_name"
+            return 0
+        fi
+
+        echo -n "."
+        sleep 5
+    done
+
+    echo ""
+    log_warn "Could not confirm tunnel establishment, but it may be working."
+    log_info "Last log output:"
+    ssh "${ap_host}" "condor_ssh_to_job -auto-retry ${job_id} 'cat vscode.log 2>/dev/null'" 2>/dev/null | tail -10 || true
+    log_info "If VS Code can connect, the tunnel is working. Proceeding..."
+    # Don't fail - the tunnel may be working with output we don't recognize
+    return 0
+}
+
+# Display connection instructions
+show_connection_info() {
+    local ap_host=$1
+    local job_id=$2
+    local tunnel_name=$3
+
+    echo ""
+    echo "=========================================="
+    echo "  Connect from VS Code Desktop:"
+    echo "  1. Install \"Remote - Tunnels\" extension"
+    echo "  2. Cmd+Shift+P -> \"Remote-Tunnels: Connect to Tunnel\""
+    echo "  3. Select tunnel: $tunnel_name"
+    echo "=========================================="
+    echo ""
+    echo "Press Ctrl+C to disconnect (job keeps running)"
+    echo "To remove: ssh $ap_host condor_rm $job_id"
+    echo "To resume: ./chtc-vscode resume $job_id"
+    echo ""
+}
+
+# Monitor tunnel log (keeps running until Ctrl+C)
+monitor_tunnel() {
+    local ap_host=$1
+    local job_id=$2
+
+    ssh "${ap_host}" "condor_ssh_to_job -auto-retry ${job_id} 'tail -f vscode.log'" 2>/dev/null || true
+}
+
+# Resume existing session
+resume_session() {
+    local ap_host=$1
+    local job_id=$2
+    local tunnel_name="chtc-${job_id}"
+
+    log_info "Resuming VS Code tunnel session for job $job_id"
+
+    # Check job is still running
+    local status
+    status=$(ssh "${ap_host}" "condor_q $job_id -af JobStatus 2>/dev/null" || echo "")
+
+    if [[ "$status" != "2" ]]; then
+        log_error "Job $job_id is not running (status: $status)"
+        exit 1
+    fi
+
+    log_success "Job $job_id is running"
+
+    # Show current log
+    log_info "Current tunnel log:"
+    echo "=========================================="
+    ssh "${ap_host}" "condor_ssh_to_job -auto-retry ${job_id} 'cat vscode.log 2>/dev/null'" 2>/dev/null || true
+    echo "=========================================="
+
+    show_connection_info "$ap_host" "$job_id" "$tunnel_name"
+    monitor_tunnel "$ap_host" "$job_id"
+}
+
+# Show usage
+show_usage() {
+    cat << 'EOF'
+chtc-vscode - Launch VS Code Remote session on CHTC HTCondor from your laptop
+
+Usage:
+  ./chtc-vscode                       Launch new VS Code tunnel session
+  ./chtc-vscode resume <JobID>        Resume existing session
+
+Environment variables:
+  AP_HOST        Access point hostname (default: ap2002.chtc.wisc.edu)
+  AP_USER        Username on AP (default: $USER)
+  SUBMIT_FILE    Local submit file to copy (default: vscode.sub)
+  LAUNCH_SCRIPT  Local launch script to copy (default: launch_vscode.sh)
+  SUBMIT_DIR     Remote directory on AP (default: /home/$AP_USER/chtc-vscode)
+
+Examples:
+  # Basic usage
+  ./chtc-vscode
+
+  # Different access point
+  AP_HOST=ap2001.chtc.wisc.edu ./chtc-vscode
+
+  # Resume existing session
+  ./chtc-vscode resume 12345
+
+The script will:
+  1. Copy vscode.sub and launch_vscode.sh to the AP
+  2. Submit the job on the AP
+  3. Wait for the job to start
+  4. Launch a VS Code tunnel on the EP
+  5. Display GitHub device auth instructions
+  6. Display tunnel connection instructions
+
+Prerequisites:
+  - SSH access to CHTC AP
+  - vscode.sub exists locally (will be copied to AP)
+  - launch_vscode.sh exists locally (will be copied to AP)
+  - Container in /staging/
+  - "Remote - Tunnels" VS Code extension on your laptop
+
+EOF
+}
+
+# Main
+main() {
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        show_usage
+        exit 0
+    fi
+
+    local ap_connection="${AP_USER}@${AP_HOST}"
+
+    # Handle resume command
+    if [[ "${1:-}" == "resume" ]]; then
+        if [[ -z "${2:-}" ]]; then
+            log_error "Resume requires a JobID"
+            log_info "Usage: $0 resume <JobID>"
+            exit 1
+        fi
+        local job_id=$2
+
+        log_info "CHTC VSCode Launcher - Resume Mode"
+        log_info "Access Point: $ap_connection"
+        log_info "Job ID: $job_id"
+        log_info ""
+
+        resume_session "$ap_connection" "$job_id"
+        exit $?
+    fi
+
+    log_info "CHTC VSCode Launcher"
+    log_info "Access Point: $ap_connection"
+    log_info "Submit File: $SUBMIT_FILE"
+    log_info "Launch Script: $LAUNCH_SCRIPT"
+    log_info "Remote Directory: $SUBMIT_DIR"
+    log_info ""
+
+    # Check if local files exist
+    if [[ ! -f "$SUBMIT_FILE" ]]; then
+        log_error "Submit file not found locally: $SUBMIT_FILE"
+        log_info "Please create $SUBMIT_FILE or set SUBMIT_FILE environment variable"
+        exit 1
+    fi
+
+    if [[ ! -f "$LAUNCH_SCRIPT" ]]; then
+        log_error "Launch script not found locally: $LAUNCH_SCRIPT"
+        log_info "Please create $LAUNCH_SCRIPT or set LAUNCH_SCRIPT environment variable"
+        exit 1
+    fi
+
+    # Test SSH connection
+    log_info "Testing SSH connection to $ap_connection..."
+    if ! ssh -o ConnectTimeout=60 "${ap_connection}" "echo ok" 2>&1 | grep -q "ok"; then
+        log_error "Cannot connect to $ap_connection"
+        log_info "Make sure you have SSH access and authentication set up"
+        log_info "Try: ssh $ap_connection"
+        exit 1
+    fi
+    log_success "SSH connection OK"
+
+    echo ""
+
+    # Submit job
+    local job_id
+    job_id=$(submit_job "$ap_connection" "$SUBMIT_FILE" "$LAUNCH_SCRIPT" "$SUBMIT_DIR")
+
+    local tunnel_name="chtc-${job_id}"
+
+    echo ""
+
+    # Wait for job to start
+    wait_for_job "$ap_connection" "$job_id"
+
+    echo ""
+
+    # Launch tunnel on EP
+    launch_tunnel "$ap_connection" "$job_id" "$tunnel_name"
+
+    # Wait a moment for the tunnel process to start
+    sleep 5
+
+    # Wait for device auth prompt and display it
+    wait_for_device_auth "$ap_connection" "$job_id"
+
+    # Wait for tunnel to be established
+    wait_for_tunnel "$ap_connection" "$job_id" "$tunnel_name"
+
+    # Show connection instructions
+    show_connection_info "$ap_connection" "$job_id" "$tunnel_name"
+
+    # Monitor tunnel log until Ctrl+C
+    monitor_tunnel "$ap_connection" "$job_id"
+}
+
+main "$@"
