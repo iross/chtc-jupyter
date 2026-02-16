@@ -22,6 +22,10 @@ SUBMIT_DIR="${SUBMIT_DIR:-/home/${AP_USER}/chtc-jupyter}"
 PORT_RANGE_START="${PORT_START:-8889}"
 PORT_RANGE_END="${PORT_END:-8999}"
 
+# SSH multiplexing (reduces password prompts on macOS/Linux/WSL)
+SSH_CONTROL_PATH="/tmp/chtc-ssh-control-$$-%r@%h:%p"
+SSH_OPTS=""
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -33,6 +37,35 @@ log_info() { echo -e "${BLUE}$(date '+%Y-%m-%d %H:%M:%S') [INFO]${NC} $*" >&2; }
 log_success() { echo -e "${GREEN}$(date '+%Y-%m-%d %H:%M:%S') [ OK ]${NC} $*" >&2; }
 log_warn() { echo -e "${YELLOW}$(date '+%Y-%m-%d %H:%M:%S') [WARN]${NC} $*" >&2; }
 log_error() { echo -e "${RED}$(date '+%Y-%m-%d %H:%M:%S')[ERROR]${NC} $*" >&2; }
+
+# Set up SSH multiplexing (single password prompt for entire session)
+setup_ssh_multiplexing() {
+    local ap_host=$1
+    log_info "Testing SSH connection to $ap_host..."
+
+    # Try to establish a ControlMaster connection
+    if ssh -o ControlMaster=yes -o ControlPath="${SSH_CONTROL_PATH}" -o ControlPersist=10m \
+         -o ConnectTimeout=60 "${ap_host}" "echo ok" 2>&1 | grep -q "ok"; then
+        SSH_OPTS="-o ControlPath=${SSH_CONTROL_PATH}"
+        log_success "SSH connection OK (multiplexing enabled)"
+    elif ssh -o ConnectTimeout=60 "${ap_host}" "echo ok" 2>&1 | grep -q "ok"; then
+        SSH_OPTS=""
+        log_success "SSH connection OK"
+        log_warn "SSH multiplexing not available — you may be prompted for your password multiple times"
+    else
+        log_error "Cannot connect to $ap_host"
+        log_info "Make sure you have SSH access and authentication set up"
+        log_info "Try: ssh $ap_host"
+        exit 1
+    fi
+}
+
+cleanup_ssh() {
+    if [[ -n "${SSH_OPTS:-}" ]]; then
+        ssh -o ControlPath="${SSH_CONTROL_PATH}" -O exit "${AP_USER}@${AP_HOST}" 2>/dev/null || true
+    fi
+}
+trap cleanup_ssh EXIT
 
 # Find available port on local machine
 find_local_port() {
@@ -63,7 +96,7 @@ find_ap_port() {
 
     # Check ports on AP via SSH
     local available_port
-    available_port=$(ssh "${ap_host}" bash << EOFREMOTE
+    available_port=$(ssh ${SSH_OPTS} "${ap_host}" bash << EOFREMOTE
 for port in $(seq $start $end); do
     if ! ss -ltn 2>/dev/null | grep -q ":\$port "; then
         echo \$port
@@ -114,7 +147,7 @@ find_common_port() {
 
     local port_list="${laptop_ports[*]}"
     local common_port
-    common_port=$(ssh "${ap_host}" bash << EOFREMOTE
+    common_port=$(ssh ${SSH_OPTS} "${ap_host}" bash << EOFREMOTE
 # Ports to check
 ports=($port_list)
 
@@ -163,15 +196,15 @@ submit_job() {
     log_info "Copying files to $ap_host:$remote_submit_dir/"
 
     # Create remote directory and copy files
-    ssh "${ap_host}" "mkdir -p $remote_submit_dir"
-    scp -q "$local_submit_file" "$local_launch_script" "${ap_host}:${remote_submit_dir}/"
+    ssh ${SSH_OPTS} "${ap_host}" "mkdir -p $remote_submit_dir"
+    scp ${SSH_OPTS} -q "$local_submit_file" "$local_launch_script" "${ap_host}:${remote_submit_dir}/"
 
     log_success "Copied $(basename $local_submit_file) and $(basename $local_launch_script)"
     log_info "Submitting job on $ap_host..."
 
     # Run condor_submit on AP and capture output
     local output
-    output=$(ssh "${ap_host}" "cd $remote_submit_dir && condor_submit $(basename $local_submit_file)" 2>&1)
+    output=$(ssh ${SSH_OPTS} "${ap_host}" "cd $remote_submit_dir && condor_submit $(basename $local_submit_file)" 2>&1)
     local status=$?
 
     if [[ $status -ne 0 ]]; then
@@ -192,44 +225,41 @@ submit_job() {
     echo "$job_id"
 }
 
-# Wait for job to start running
+# Wait for job to start running (single persistent SSH session)
 wait_for_job() {
     local ap_host=$1
     local job_id=$2
 
     log_info "Waiting for job $job_id to start..."
 
-    while true; do
-        local status
-        status=$(ssh "${ap_host}" "condor_q $job_id -af JobStatus 2>/dev/null" || echo "")
+    local tmpfile
+    tmpfile=$(mktemp)
 
-        if [[ -z "$status" ]]; then
-            log_error "Job $job_id not found in queue"
-            exit 1
-        fi
+    ssh ${SSH_OPTS} "${ap_host}" bash -s "$job_id" > "$tmpfile" << 'EOFREMOTE'
+job_id=$1
+while true; do
+    status=$(condor_q $job_id -af JobStatus 2>/dev/null)
+    case "$status" in
+        2) echo "RUNNING"; exit 0 ;;
+        3|4) echo "ENDED"; exit 1 ;;
+        5) echo "HELD"; exit 2 ;;
+        1) echo -n "." >&2; sleep 5 ;;
+        "") echo "NOT_FOUND"; exit 3 ;;
+    esac
+done
+EOFREMOTE
+    local exit_code=$?
+    local result
+    result=$(cat "$tmpfile")
+    rm -f "$tmpfile"
 
-        case $status in
-            2) # Running
-                echo ""
-                log_success "Job is running"
-                return 0
-                ;;
-            3|4) # Removed/Completed
-                echo ""
-                log_error "Job ended before starting"
-                exit 1
-                ;;
-            5) # Held
-                echo ""
-                log_error "Job is held. Check with: ssh $ap_host condor_q -hold $job_id"
-                exit 1
-                ;;
-            1) # Idle
-                echo -n "."
-                sleep 5
-                ;;
-        esac
-    done
+    echo "" # newline after dots
+    case $exit_code in
+        0) log_success "Job is running" ;;
+        1) log_error "Job ended before starting"; exit 1 ;;
+        2) log_error "Job is held. Check with: ssh $ap_host condor_q -hold $job_id"; exit 1 ;;
+        3) log_error "Job $job_id not found in queue"; exit 1 ;;
+    esac
 }
 
 # Display Jupyter connection info and instructions
@@ -241,7 +271,7 @@ show_connection_info() {
     echo ""
     echo "Jupyter Lab connection info for job ${job_id}:"
     echo "=========================================="
-    ssh "${ap_host}" "condor_ssh_to_job -auto-retry ${job_id} 'cat jupyter.log 2>/dev/null || echo \"Log file not found - Jupyter may not be running\"'" || true
+    ssh ${SSH_OPTS} "${ap_host}" "condor_ssh_to_job -auto-retry ${job_id} 'cat jupyter.log 2>/dev/null || echo \"Log file not found - Jupyter may not be running\"'" || true
     echo "=========================================="
     echo ""
     echo "Copy the URL above and paste it in your browser to access Jupyter"
@@ -268,7 +298,7 @@ maintain_port_forwarding() {
     local job_id=$2
     local port=$3
 
-    ssh -L ${port}:localhost:${port} "${ap_host}" bash << EOFAP
+    ssh ${SSH_OPTS} -L ${port}:localhost:${port} "${ap_host}" bash << EOFAP
 # Create temporary SSH script with port forwarding for EP->AP connection
 temp_ssh=\$(mktemp)
 cat > "\$temp_ssh" << 'EOFSSH'
@@ -311,7 +341,7 @@ launch_jupyter() {
     # Launch in background to avoid blocking
     # The key is the entire condor_ssh_to_job heredoc needs to be backgrounded
     # but we do it from the AP side, not wrapping the SSH call from laptop
-    ssh "${ap_host}" bash << EOFAP &
+    ssh ${SSH_OPTS} "${ap_host}" bash << EOFAP &
 # Create temporary SSH script with port forwarding for EP->AP connection
 temp_ssh=\$(mktemp)
 cat > "\$temp_ssh" << 'EOFSSH'
@@ -439,6 +469,7 @@ main() {
         log_info "Port: $port"
         log_info ""
 
+        setup_ssh_multiplexing "$ap_connection"
         resume_session "$ap_connection" "$job_id" "$port"
         exit $?
     fi
@@ -465,15 +496,8 @@ main() {
         exit 1
     fi
 
-    # Test SSH connection
-    log_info "Testing SSH connection to $ap_connection..."
-    if ! ssh -o ConnectTimeout=60 "${ap_connection}" "echo ok" 2>&1 | grep -q "ok"; then
-        log_error "Cannot connect to $ap_connection"
-        log_info "Make sure you have SSH access and authentication set up"
-        log_info "Try: ssh $ap_connection"
-        exit 1
-    fi
-    log_success "SSH connection OK"
+    # Test SSH connection and set up multiplexing
+    setup_ssh_multiplexing "$ap_connection"
 
     # Find common available port
     local port
