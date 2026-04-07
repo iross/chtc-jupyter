@@ -356,8 +356,17 @@ connect_and_launch() {
     echo "Starting Jupyter Lab on port ${port}..."
     launch_jupyter "$ap_host" "$job_id" "$port"
 
-    echo "Waiting for Jupyter to start..."
-    sleep 20
+    # Wait for jupyter.log to appear on the EP (up to 60s)
+    log_info "Waiting for Jupyter to start..."
+    for i in $(seq 1 12); do
+        local log_content
+        log_content=$(ssh "${ap_host}" "condor_ssh_to_job ${job_id} 'cat jupyter.log 2>/dev/null'" 2>/dev/null || echo "")
+        if [[ -n "$log_content" ]]; then
+            break
+        fi
+        echo -n "."
+        sleep 5
+    done
     echo ""
 
     # Show connection info and establish persistent forwarding
