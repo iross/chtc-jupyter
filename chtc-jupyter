@@ -241,7 +241,7 @@ show_connection_info() {
     echo ""
     echo "Jupyter Lab connection info for job ${job_id}:"
     echo "=========================================="
-    ssh "${ap_host}" "condor_ssh_to_job -auto-retry ${job_id} 'cat jupyter.log 2>/dev/null || echo \"Log file not found - Jupyter may not be running\"'" || true
+    ssh "${ap_host}" "unset SSH_AUTH_SOCK; condor_ssh_to_job -auto-retry ${job_id} 'cat jupyter.log 2>/dev/null || echo \"Log file not found - Jupyter may not be running\"'" || true
     echo "=========================================="
     echo ""
     echo "Copy the URL above and paste it in your browser to access Jupyter"
@@ -269,6 +269,9 @@ maintain_port_forwarding() {
     local port=$3
 
     ssh -L ${port}:localhost:${port} "${ap_host}" bash << EOFAP
+# Only offer the condor-generated key, not agent keys (avoids "Too many authentication failures")
+unset SSH_AUTH_SOCK
+
 # Create temporary SSH script with port forwarding for EP->AP connection
 temp_ssh=\$(mktemp)
 cat > "\$temp_ssh" << 'EOFSSH'
@@ -278,7 +281,7 @@ EOFSSH
 chmod +x "\$temp_ssh"
 
 # Use condor_ssh_to_job with the custom SSH wrapper and keep connection alive
-condor_ssh_to_job -ssh "\$temp_ssh" ${job_id} 'tail -f /dev/null'
+condor_ssh_to_job -auto-retry -ssh "\$temp_ssh" ${job_id} 'tail -f /dev/null'
 
 # Cleanup
 rm -f "\$temp_ssh"
@@ -308,33 +311,25 @@ launch_jupyter() {
     local job_id=$2
     local port=$3
 
-    # Launch in background to avoid blocking
-    # The key is the entire condor_ssh_to_job heredoc needs to be backgrounded
-    # but we do it from the AP side, not wrapping the SSH call from laptop
-    ssh "${ap_host}" bash << EOFAP &
-# Create temporary SSH script with port forwarding for EP->AP connection
-temp_ssh=\$(mktemp)
-cat > "\$temp_ssh" << 'EOFSSH'
-#!/bin/bash
-exec ssh -L ${port}:localhost:${port} "\$@"
-EOFSSH
-chmod +x "\$temp_ssh"
+    # Pass the launch command as an argument: docker-universe jobs cannot
+    # allocate a PTY for a non-interactive session ("the input device is not a TTY")
+    ssh "${ap_host}" "unset SSH_AUTH_SOCK; condor_ssh_to_job -auto-retry ${job_id} 'if [ -f ./launch_jupyter.sh ]; then nohup ./launch_jupyter.sh ${port} > jupyter.log 2>&1 & else export HOME=\$(pwd); nohup jupyter lab --no-browser --port=${port} > jupyter.log 2>&1 & fi'"
+}
 
-# Connect to EP and launch Jupyter (heredoc is sent to condor_ssh_to_job)
-condor_ssh_to_job -auto-retry -ssh "\$temp_ssh" ${job_id} << 'EOFEP'
-date > jupyter.log
-if [[ -f ./launch_jupyter.sh ]]; then
-    nohup ./launch_jupyter.sh ${port} > jupyter.log 2>&1 &
-else
-    export HOME=\$(pwd)
-    nohup jupyter lab --no-browser --port=${port} >> jupyter.log 2>&1 &
-fi
-exit
-EOFEP
+# Wait for Jupyter to write its URL to jupyter.log on the EP
+wait_for_jupyter() {
+    local ap_host=$1
+    local job_id=$2
 
-# Cleanup
-rm -f "\$temp_ssh"
-EOFAP
+    echo "Waiting for Jupyter to start (a container pull can take several minutes)..."
+    if ssh "${ap_host}" "unset SSH_AUTH_SOCK; condor_ssh_to_job -auto-retry ${job_id} 'for i in \$(seq 1 90); do grep -q http jupyter.log 2>/dev/null && exit 0; sleep 10; done; exit 1'"; then
+        log_success "Jupyter is up"
+        return 0
+    fi
+
+    log_error "Timed out waiting for Jupyter to write a URL to jupyter.log"
+    log_info "Inspect manually: ssh ${ap_host}, then: condor_ssh_to_job ${job_id} and cat jupyter.log"
+    return 1
 }
 
 # Connect and launch Jupyter
@@ -356,17 +351,7 @@ connect_and_launch() {
     echo "Starting Jupyter Lab on port ${port}..."
     launch_jupyter "$ap_host" "$job_id" "$port"
 
-    # Wait for jupyter.log to appear on the EP (up to 60s)
-    log_info "Waiting for Jupyter to start..."
-    for i in $(seq 1 12); do
-        local log_content
-        log_content=$(ssh "${ap_host}" "condor_ssh_to_job ${job_id} 'cat jupyter.log 2>/dev/null'" 2>/dev/null || echo "")
-        if [[ -n "$log_content" ]]; then
-            break
-        fi
-        echo -n "."
-        sleep 5
-    done
+    wait_for_jupyter "$ap_host" "$job_id"
     echo ""
 
     # Show connection info and establish persistent forwarding

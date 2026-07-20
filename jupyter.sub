@@ -1,7 +1,12 @@
 # jupyter.sub
-log = jupyter.log
+# Event log; must not share a name with the runtime jupyter.log transferred back on exit
+log = condor.log
 
-container_image = file:///staging/iaross/jupyter_lite.sif
+universe = docker
+docker_image = iaross/jupyter_2026-07-10-1
+# Share the host network namespace so the ssh port-forward chain can reach
+# Jupyter on localhost (bridge networking hides the container's 127.0.0.1)
+docker_network_type = host
 
 transfer_executable = false
 transfer_input_files = launch_jupyter.sh
@@ -10,22 +15,23 @@ when_to_transfer_output = ON_EXIT_OR_EVICT
 My.SpoolOnEvict = false
 
 executable = /bin/sleep
-arguments = 12h
+arguments = 168h
 output = jupyter.out
+stream_output = true
 error = jupyter.err
+stream_error = true
 
 # Adjust resources as desired
 request_cpus = 1
 request_memory = 16GB
 request_disk = 16GB
-
-requirements= Machine!="gpu4000.chtc.wisc.edu"
+# Uncomment to land on DGX Sparks
+# requirements = Arch == "aarch64"
 
 ## If using GPUs:
-#+WantGPULab = true
-#+GPUJobLength = "short"
-#+is_resumable = true
-#request_gpus = 1
++GPUJobLength = "long"
+request_gpus = 1
+
 ## adjust as desired:
 #gpus_minimum_memory = 10GB
 #gpus_minimum_capability = 5.0
