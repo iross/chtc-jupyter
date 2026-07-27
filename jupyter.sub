@@ -26,7 +26,7 @@ request_cpus = 1
 request_memory = 16GB
 request_disk = 16GB
 # Uncomment to land on DGX Sparks
-# requirements = Arch == "aarch64"
+requirements = Arch == "aarch64"
 
 ## If using GPUs:
 +GPUJobLength = "long"
